@@ -23,6 +23,7 @@ import hashlib, os, subprocess, sys, time
 VIGILADO = os.environ.get('VIGILADO_DIR', 'vigilado')
 ESTADO = os.environ.get('ESTADO_DIR', 'estado')
 TSV = 'control_plane/ai/state/reconciliacion/UNIVERSO_CAPABILITIES.tsv'
+COLA_IDX = 'control_plane/ai/cola/cola_index.tsv'      # ADR-225: el vence de la ficha que gobierna una fila también protege
 RAMA = os.environ.get('RAMA', 'master')
 
 
@@ -74,9 +75,61 @@ def protegida(f):
     return f.get('procedencia') == 'OPERADOR' or f.get('dominio') == 'legal'
 
 
+CAMPOS = ('disparador', 'prioridad', 'madurez', 'mecanismo', 'vence')
+
+
+def huella_aprobacion(f, c):
+    """El estado protegido completo de la fila: sentido, terminal y campos de protección (disparador, prioridad, madurez, mecanismo y el
+    vence de su ficha)."""
+    return hashlib.sha256('\x1f'.join([sentido(f), str(int(terminal(f)))] + [c.get(k, '') for k in CAMPOS]).encode()).hexdigest()[:32]
+
+
+def token(i, ha_prev, ha_new):
+    """(ADR-225) Lo que aprueba el operador: ESTA transición (de qué estado a qué estado), no un estado. Se consume al usarse: volver
+    después a un estado aprobado antes no pasa solo."""
+    return hashlib.sha256(f'{i}\x1f{ha_prev or "-"}\x1f{ha_new}'.encode()).hexdigest()[:32]
+
+
 def huella(f):
     """Lo que aprueba el operador: ESTE sentido nuevo de la fila (128 bits), no la fila para siempre."""
     return hashlib.sha256((sentido(f) + '\x1f' + str(int(terminal(f)))).encode()).hexdigest()[:32]
+
+
+RANGO = {'P0': 0, 'P1': 1, 'P2': 2, 'P3': 3, '-': 4}
+MADUREZ = {'DEMOSTRADA': 3, 'PARCIAL': 2, 'ABIERTA': 1, 'AUSENTE': 0}
+
+
+def debilita(a, n):
+    """(ADR-224) Una fila protegida pierde protección sin cambiar de sentido: disparador a ninguno, fecha aplazada, prioridad bajada o
+    madurez degradada. Aquí no se sabe si un acto se resolvió (el ledger lo escribe O): todo debilitamiento de una protegida se aprueba."""
+    da, dn = a.get('disparador', ''), n.get('disparador', '')
+    if da and dn and da != dn:
+        if da.split(':')[0] in ('acto', 'fecha', 'evento') and dn == 'ninguno':
+            return True
+        if da.startswith('fecha:') and dn.startswith('fecha:') and dn[6:16] > da[6:16]:
+            return True
+    if a.get('prioridad') in RANGO and RANGO.get(n.get('prioridad'), 9) > RANGO[a['prioridad']]:
+        return True
+    if a.get('vence') and n.get('vence') and n['vence'] > a['vence']:      # aparcada en una ficha que vence después (o la misma, alargada)
+        return True
+    return MADUREZ.get(n.get('madurez'), 9) < MADUREZ.get(a.get('madurez'), -1)
+
+
+_cv = {}
+
+
+def cola_vence(sha):
+    """vence de cada COLA en ESA versión del índice (no el actual: si no, alargar la ficha y la tabla a la vez lo escondería)."""
+    if sha not in _cv:
+        rc, t = git('show', f'{sha}:{COLA_IDX}')
+        _cv[sha] = {l.split('\t')[0]: l.split('\t')[5] for l in t.splitlines() if not l.startswith('#') and len(l.split('\t')) > 5} if rc == 0 else {}
+    return _cv[sha]
+
+
+def campos(f, cv=None):
+    c = {k: f.get(k, '').strip() for k in ('disparador', 'prioridad', 'madurez', 'mecanismo')}
+    c['vence'] = (cv or {}).get(c['mecanismo'], '') if c['mecanismo'].startswith('COLA-') else ''
+    return c
 
 
 def version(sha):
@@ -86,27 +139,34 @@ def version(sha):
     return tabla(t)
 
 
-def comprueba(sha, filas, estado, vistos, aprob, fallos):
+def comprueba(sha, filas, estado, vistos, aprob, usadas, usa, fallos):
     """Compara UNA versión contra el estado acumulado y lo avanza (sólo se guarda si no hay fallos)."""
+    cv = cola_vence(sha)
     for i in sorted(vistos - set(filas)):
         fallos.append(f'capability borrada en {sha[:12]}: {i} estuvo en la tabla y no está')
     for i, f in sorted(filas.items()):
-        h, prot = huella(f), protegida(f)
+        h, prot, c = huella(f), protegida(f), campos(f, cv)
+        ha = huella_aprobacion(f, c)
         prev = estado.get(i)
         if prev is None:
             cambio = prot                                    # nace protegida
         else:
-            cambio = (prev[0] or prot) and h != prev[1]      # protegida antes O después: cambiar de sentido, retirarse o entrar
-        if cambio and (i, h) not in aprob:
-            fallos.append(f'fila protegida {i} {"nace" if prev is None else "cambia de sentido, se retira o entra en protección"} en {sha[:12]} '
-                          f'sin aprobación del operador en aprobaciones.tsv del testigo (si la apruebas, añade la línea «{i} {h}»)')
-        estado[i] = (prot, h)
+            cambio = (prev[0] or prot) and (h != prev[1] or (prev[2] is not None and debilita(prev[2], c)))
+        if cambio:
+            tk = token(i, prev[3] if prev else None, ha)
+            if (i, tk) in aprob and tk not in usadas:
+                usa.append(tk)
+            else:
+                fallos.append(f'fila protegida {i} {"nace" if prev is None else "cambia de sentido, se debilita, se retira o entra en protección"} en {sha[:12]} '
+                              f'sin aprobación del operador en aprobaciones.tsv del testigo (si la apruebas, añade la línea «{i} {tk}»)')
+        estado[i] = (prot, h, c, ha)
     vistos |= set(filas)
 
 
 def main():
     os.makedirs(ESTADO, exist_ok=True)
-    p = {k: os.path.join(ESTADO, k + x) for k, x in (('master', '.txt'), ('ids', '.txt'), ('filas', '.tsv'), ('rojo', '.txt'), ('revisar', '.txt'))}
+    p = {k: os.path.join(ESTADO, k + x) for k, x in (('master', '.txt'), ('ids', '.txt'), ('filas', '.tsv'), ('rojo', '.txt'), ('revisar', '.txt'),
+                                                       ('usadas', '_aprobaciones_usadas.txt'))}
     fallos = []
     rc, head = git('rev-parse', '--verify', f'refs/remotes/origin/{RAMA}')
     head = head.strip()
@@ -122,11 +182,14 @@ def main():
     rojo = open(p['rojo']).read().strip() if os.path.exists(p['rojo']) else ''
     previo = open(p['master']).read().strip() if os.path.exists(p['master']) else ''
     vistos = set(open(p['ids']).read().split()) if os.path.exists(p['ids']) else set()
+    usadas = set(open(p['usadas']).read().split()) if os.path.exists(p['usadas']) else set()
+    usa = []
     estado = {}
     if os.path.exists(p['filas']):
         for l in open(p['filas']):
-            i, prot, h = l.rstrip('\n').split('\t')
-            estado[i] = (prot == '1', h)
+            x = l.rstrip('\n').split('\t')   # formatos: 3 campos (ADR-222), 6 (ADR-224) y 9 (ADR-225: + mecanismo, vence y huella de aprobación)
+            c = dict(zip(CAMPOS, x[3:8])) if len(x) >= 9 else (dict(zip(CAMPOS[:3], x[3:6])) if len(x) >= 6 else None)
+            estado[x[0]] = (x[1] == '1', x[2], c, x[8] if len(x) >= 9 else None)
     arranque = not previo
     ahora = {}
     if rojo:
@@ -134,8 +197,9 @@ def main():
     elif os.path.exists(p['revisar']) and head and not arranque:   # el operador borró el rojo: acepta lo visto hasta la última corrida en rojo
         previo = open(p['revisar']).read().strip()
         ahora, _ = version(previo)                   # ya la revisó el operador: no se re-juzga; lo posterior, sí
+        cv = cola_vence(previo)
         for i, f in ahora.items():
-            estado[i] = (protegida(f), huella(f))
+            c = campos(f, cv); estado[i] = (protegida(f), huella(f), c, huella_aprobacion(f, c))
         vistos |= set(ahora)
         os.remove(p['revisar'])
     if head and arranque:
@@ -146,8 +210,9 @@ def main():
         fallos += err
         for i in sorted(vistos - set(ahora)):
             fallos.append(f'capability borrada: {i} estuvo en la tabla y no está')
+        cv = cola_vence(head)
         for i, f in ahora.items():
-            estado[i] = (protegida(f), huella(f))
+            c = campos(f, cv); estado[i] = (protegida(f), huella(f), c, huella_aprobacion(f, c))
         vistos |= set(ahora)
         fallos.append(f'ARRANQUE: línea base inicial de {len(ahora)} filas ({sum(1 for f in ahora.values() if protegida(f))} protegidas) '
                       'fijada sin revisión. Si acabas de crear el testigo, este correo es el simulacro: borra estado/rojo.txt para confirmarla')
@@ -156,22 +221,26 @@ def main():
             fallos.append(f'historia reescrita: el master visto antes ({previo[:12]}) ya no es antepasado del actual ({head[:12]})')
             shas = [head]
         else:
-            rc, out = git('log', '--format=%H', '--reverse', f'{previo}..{head}', '--', TSV)
+            rc, out = git('log', '--format=%H', '--reverse', f'{previo}..{head}', '--', TSV, COLA_IDX)
             if rc != 0:
                 fallos.append('git no pudo listar los commits desde la última corrida')
             shas = out.split() or [head]
         for sha in shas:
             ahora, err = version(sha)
             fallos += [f'{sha[:12]}: {e}' for e in err]
-            comprueba(sha, ahora, estado, vistos, aprob, fallos)
+            comprueba(sha, ahora, estado, vistos, aprob, usadas, usa, fallos)
     if head and (not fallos or arranque):
         with open(p['master'], 'w') as o:
             o.write(head + '\n')
         with open(p['ids'], 'w') as o:
             o.write('\n'.join(sorted(vistos)) + '\n')
         with open(p['filas'], 'w') as o:
-            for i, (prot, h) in sorted(estado.items()):
-                o.write(f'{i}\t{int(prot)}\t{h}\n')
+            for i, e in sorted(estado.items()):
+                c = e[2] or {}
+                o.write('\t'.join([i, str(int(e[0])), e[1]] + [c.get(k, '') for k in CAMPOS] + [e[3] or '']) + '\n')
+        if usa:                                       # aprobaciones consumidas: no vuelven a valer
+            with open(p['usadas'], 'a') as o:
+                o.write(''.join(t + '\n' for t in usa))
     if fallos:
         ya = set(rojo.splitlines())
         nuevos = [x[:400] for x in fallos if not x.startswith('rojo ENCLAVADO') and x[:400] not in ya]
