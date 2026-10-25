@@ -1,0 +1,47 @@
+# Testigo de forja de Servidor (servidor ADR-222).
+name: testigo de forja
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency: testigo
+
+jobs:
+  vigilar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: leer servidor
+        uses: actions/checkout@v4
+        with:
+          repository: alexisoller-cpu/servidor
+          ref: master
+          token: ${{ secrets.SERVIDOR_TOKEN }}
+          path: vigilado
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: comprobar
+        id: comprobar
+        run: python3 verificar.py
+        continue-on-error: true
+
+      - name: guardar lo visto
+        run: |
+          git config user.name testigo
+          git config user.email testigo@users.noreply.github.com
+          git add estado
+          git diff --cached --quiet || git commit -qm "testigo: ${GITHUB_RUN_ID} ${{ steps.comprobar.outcome }}"
+          git push -q
+
+      - name: fallar si el testigo vio algo
+        if: steps.comprobar.outcome != 'success'
+        run: exit 1
