@@ -1,0 +1,1 @@
+ARRANQUE: línea base inicial de 163 filas (48 protegidas) fijada sin revisión. Si acabas de crear el testigo, este correo es el simulacro: borra estado/rojo.txt para confirmarla
