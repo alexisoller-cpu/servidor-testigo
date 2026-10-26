@@ -1,0 +1,5 @@
+fila protegida EX09 cambia de sentido, se debilita, se retira o entra en protección en 60a7313b6cb4 sin aprobación del operador en aprobaciones.tsv del testigo (si la apruebas, añade la línea «EX09 586695cbc814b038697bbfd3362c46b4»)
+fila protegida EX13 nace en 60a7313b6cb4 sin aprobación del operador en aprobaciones.tsv del testigo (si la apruebas, añade la línea «EX13 e35a90b51498e459dba7680b1fc669c8»)
+fila protegida EX14 nace en 60a7313b6cb4 sin aprobación del operador en aprobaciones.tsv del testigo (si la apruebas, añade la línea «EX14 e3578792cee191acced7b5274c4e2b34»)
+fila protegida OP16 nace en 60a7313b6cb4 sin aprobación del operador en aprobaciones.tsv del testigo (si la apruebas, añade la línea «OP16 3ea2d28a83d2e3bbc0d85c6bb266d62f»)
+fila protegida PV06 nace en 60a7313b6cb4 sin aprobación del operador en aprobaciones.tsv del testigo (si la apruebas, añade la línea «PV06 5a8539857df73d42f3297040fe776eb7»)
